@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
-Impedance Spectrum Analyzer v0.1
+Impedance Spectrum Analyzer v0.4 (matplotlib backend)
 Uses a sound card (PortAudio) for duplex audio I/O.
 Transmits a sparse multi-tone test signal and measures impedance via two-channel FFT analysis.
 
 Architecture:
   - Main thread: Qt event loop, UI updates via signals
   - Audio thread: sounddevice callback manages ring buffers (send/receive)
-  - DSP worker thread: calculates FFTs, complex quotients, impedance
-  - Calibration and configuration stored in-memory, save/load deferred to v0.2+
+  - DSP worker: calculates FFTs, complex quotients, impedance
+  - Plotting: matplotlib with PySide6 backend for reliable dual y-axis with log x-scale
 
 Usage:
   python impedance_meas.py                    # Use default soundcard
@@ -45,17 +45,10 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtGui import QStandardItemModel, QStandardItem
 
-# Try to import pyqtgraph for plotting; fallback to matplotlib if needed
-try:
-    import pyqtgraph as pg
-    HAVE_PYQTGRAPH = True
-except ImportError:
-    HAVE_PYQTGRAPH = False
-    print("Warning: pyqtgraph not available. Using matplotlib.", file=sys.stderr)
-
-if HAVE_PYQTGRAPH:
-    pg.setConfigOption("background", "white")
-    pg.setConfigOption("foreground", "black")
+# Matplotlib imports
+from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+import matplotlib
 
 
 # ============================================================================
@@ -380,6 +373,62 @@ class DSPWorker(QObject):
 
 
 # ============================================================================
+# Matplotlib Canvas for Dual Axis Plot
+# ============================================================================
+
+class SpectrumCanvas(FigureCanvas):
+    """Matplotlib canvas with dual y-axes for magnitude and phase."""
+
+    def __init__(self, parent=None):
+        self.fig = Figure(figsize=(8, 6), dpi=100)
+        self.fig.patch.set_facecolor('white')
+        
+        # Create main axis for magnitude
+        self.ax_mag = self.fig.add_subplot(111)
+        self.ax_mag.set_xlabel('Frequency (Hz)', fontsize=10)
+        self.ax_mag.set_ylabel('Magnitude (dB)', color='blue', fontsize=10)
+        self.ax_mag.tick_params(axis='y', labelcolor='blue')
+        self.ax_mag.set_xscale('log')
+        self.ax_mag.grid(True, alpha=0.3, which='both')
+        
+        # Create secondary axis for phase (shares x-axis, independent y-axis)
+        self.ax_phase = self.ax_mag.twinx()
+        self.ax_phase.set_ylabel('Phase (°)', color='red', fontsize=10)
+        self.ax_phase.tick_params(axis='y', labelcolor='red')
+        self.ax_phase.set_ylim(-180, 180)  # Fixed range
+        
+        # Plot lines (will be created on first data)
+        self.line_mag, = self.ax_mag.plot([], [], 'b-', linewidth=2, label='Magnitude', zorder=2)
+        self.line_phase, = self.ax_phase.plot([], [], 'r-', linewidth=2, label='Phase', zorder=1)
+        
+        # Add legends
+        lines_mag = [self.line_mag]
+        lines_phase = [self.line_phase]
+        labels_mag = [l.get_label() for l in lines_mag]
+        labels_phase = [l.get_label() for l in lines_phase]
+        
+        self.ax_mag.legend(lines_mag, labels_mag, loc='upper left', fontsize=9)
+        self.ax_phase.legend(lines_phase, labels_phase, loc='upper right', fontsize=9)
+        
+        self.fig.tight_layout()
+        
+        super().__init__(self.fig)
+        self.setParent(parent)
+
+    def update_plot(self, frequencies, magnitude_db, phase_deg):
+        """Update plot with new data."""
+        self.line_mag.set_data(frequencies, magnitude_db)
+        self.line_phase.set_data(frequencies, phase_deg)
+        
+        # Auto-scale magnitude axis
+        self.ax_mag.relim()
+        self.ax_mag.autoscale_view(scalex=True, scaley=True)
+        
+        # Redraw
+        self.fig.canvas.draw_idle()
+
+
+# ============================================================================
 # Qt UI Main Window
 # ============================================================================
 
@@ -391,7 +440,7 @@ class ImpedanceAnalyzerUI(QMainWindow):
         self.stream_manager = stream_manager
         self.dsp_worker = dsp_worker
 
-        self.setWindowTitle("Impedance Spectrum Analyzer v0.1")
+        self.setWindowTitle("Impedance Spectrum Analyzer v0.4 (matplotlib)")
         self.setGeometry(100, 100, 1600, 900)
 
         # Central widget layout
@@ -400,13 +449,8 @@ class ImpedanceAnalyzerUI(QMainWindow):
         main_layout = QHBoxLayout(central_widget)
 
         # Left: Plot area (takes most space)
-        if HAVE_PYQTGRAPH:
-            self.setup_pyqtgraph_plot()
-            main_layout.addWidget(self.plot_widget, 3)
-        else:
-            label = QLabel("Plotting not available (install pyqtgraph)")
-            main_layout.addWidget(label, 3)
-            self.plot_widget = None
+        self.canvas = SpectrumCanvas(self)
+        main_layout.addWidget(self.canvas, 3)
 
         # Right: Control panel
         control_panel = QWidget()
@@ -421,7 +465,7 @@ class ImpedanceAnalyzerUI(QMainWindow):
         self.fft_size_spinbox.setEnabled(False)  # Fixed for now
         control_layout.addWidget(self.fft_size_spinbox)
 
-        # Bin number (display only, not used in v0.1)
+        # Frequency points
         control_layout.addWidget(QLabel("Frequency Points:"))
         self.freq_points_label = QLabel(f"{len(self.dsp_worker.sparse_bins)}")
         control_layout.addWidget(self.freq_points_label)
@@ -434,7 +478,7 @@ class ImpedanceAnalyzerUI(QMainWindow):
         self.amplitude_spinbox.setValue(TEST_SIGNAL_AMPLITUDE / DAC_SPAN_PEAK)
         control_layout.addWidget(self.amplitude_spinbox)
 
-        # Phase (display only in v0.1)
+        # Phase offset (display only)
         control_layout.addWidget(QLabel("Phase offset: 0°"))
 
         # Buttons
@@ -447,7 +491,7 @@ class ImpedanceAnalyzerUI(QMainWindow):
         self.stop_button.setEnabled(False)
         control_layout.addWidget(self.stop_button)
 
-        # Calibration buttons (placeholders for v0.2+)
+        # Calibration buttons (placeholders)
         control_layout.addWidget(QLabel("Calibration:"))
         self.cal_open_button = QPushButton("Calibrate Open")
         self.cal_open_button.clicked.connect(self.on_calibrate_open)
@@ -478,51 +522,16 @@ class ImpedanceAnalyzerUI(QMainWindow):
         self.dsp_timer.timeout.connect(self.dsp_worker.run_loop)
         self.dsp_timer.setInterval(50)  # Process every 50 ms
 
-    def setup_pyqtgraph_plot(self):
-        """Set up the pyqtgraph plotting widget."""
-        self.plot_widget = pg.GraphicsLayoutWidget()
-        self.plot_item = self.plot_widget.addPlot()
-
-        # Set up axes
-        self.plot_item.setLabel("bottom", "Frequency", units="Hz", color="black")
-        self.plot_item.setLabel("left", "Magnitude", units="dB", color="blue")
-        self.plot_item.setLabel("right", "Phase", units="°", color="red")
-
-        # Add a second y-axis for phase
-        self.phase_axis = pg.AxisItem(orientation="right")
-        self.plot_item.layout.addItem(self.phase_axis, 2, 3)
-        self.phase_axis.linkToView(self.plot_item.vb)
-
-        # Plot lines (will be created on first data)
-        self.magnitude_line = None
-        self.phase_line = None
-
-        # Set log scale for x-axis
-        self.plot_item.setLogMode(x=True, y=False)
-
-        # Styling
-        self.plot_item.showGrid(True, True, alpha=0.3)
-        pen_mag = QPen(QColor("blue"), 2)
-        pen_phase = QPen(QColor("red"), 2)
-
     @Slot(dict)
     def on_spectrum_ready(self, data: dict):
         """Update plot when FFT results are ready."""
-        if not HAVE_PYQTGRAPH:
-            return
-
         frequencies = data['frequencies']
         magnitude_db = data['magnitude_db']
         phase_deg = data['phase_deg']
 
-        if self.magnitude_line is None:
-            self.magnitude_line = self.plot_item.plot(
-                frequencies, magnitude_db, pen=QPen(QColor("blue"), 2), name="Magnitude (dB)"
-            )
-        else:
-            self.magnitude_line.setData(frequencies, magnitude_db)
+        # Update matplotlib canvas
+        self.canvas.update_plot(frequencies, magnitude_db, phase_deg)
 
-        # Phase plot on secondary y-axis (approximated)
         self.status_label.setText(
             f"FFT #{data['fft_count']}: {len(frequencies)} frequencies, "
             f"freq range {frequencies[0]:.1f} - {frequencies[-1]:.1f} Hz"
