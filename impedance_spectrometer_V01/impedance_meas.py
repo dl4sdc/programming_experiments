@@ -42,6 +42,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QSlider,
     QMessageBox,
+    QProgressBar,
 )
 from PySide6.QtGui import QStandardItemModel, QStandardItem
 
@@ -71,15 +72,11 @@ REF_RESISTANCE = 100.0
 @dataclass
 class CalibrationCoefficients:
     """Complex calibration coefficients for two-port impedance calculation."""
-    A: complex = complex(REF_RESISTANCE, 0.0)
-    B: complex = complex(0.0, 0.0)
-    C: complex = complex(-1.0, 0.0)
-    D: complex = complex(1.0, 0.0)
+    A: np.ndarray | complex = complex(1.0, 0.0)
+    B: np.ndarray | complex = complex(0.0, 0.0)
+    C: np.ndarray | complex = complex(0.0, 0.0)
+    D: np.ndarray | complex = complex(1.0, 0.0)
 
-
-# ============================================================================
-# Multi-tone Synthesis
-# ============================================================================
 
 def compute_sparse_frequencies() -> list[int]:
     """
@@ -87,35 +84,60 @@ def compute_sparse_frequencies() -> list[int]:
     frequencies have a maximum ratio of FREQ_RATIO_MAX, starting from
     5/12 of the sample rate and stepping down.
 
-    Returns:
-        List of FFT bin indices in ascending order.
+    The implementation skips 50 Hz interference and keeps the ratio of
+    adjacent tones below FREQ_RATIO_MAX.
     """
-    nyquist_bin = FFT_SIZE // 2
     start_freq = FREQ_START_FRACTION * SAMPLE_RATE
     start_bin = int(start_freq / (SAMPLE_RATE / FFT_SIZE))
 
-    bins = []
+    bins: list[int] = []
     current_bin = start_bin
     while current_bin >= 1:
         bins.append(current_bin)
-        # Next bin such that ratio of frequencies <= FREQ_RATIO_MAX
-        next_bin = int(current_bin / FREQ_RATIO_MAX)
-        if next_bin == current_bin or next_bin < 1:
+        next_bin = int(np.ceil(current_bin / FREQ_RATIO_MAX))
+        if next_bin == current_bin or next_bin < 10:
             break
+        if next_bin == 50:
+            if current_bin == 51:
+                next_bin = 49
+            else:
+                next_bin = 51
         current_bin = next_bin
 
     return sorted(bins)
 
 
-def schroeder_phase_sequence(n: int) -> np.ndarray:
-    """
-    Generate Schroeder phase sequence for n tones to minimize crest factor.
-    Phases are in radians.
-    """
-    return np.array([
-        -np.pi * k * (k + 1) / n for k in range(n)
-    ])
+SPARSE_FREQ_BINS = compute_sparse_frequencies()
 
+
+def apply_calibration_coefficients(v_open, v_short, v_load, ref_resistance: float):
+    """
+    Calculate calibration arrays for the two-port equation:
+        Z = (A*V + B) / (C*V + D)
+    with D set to 1.0 for the over-determined system.
+    """
+    v_open = np.asarray(v_open, dtype=np.complex128)
+    v_short = np.asarray(v_short, dtype=np.complex128)
+    v_load = np.asarray(v_load, dtype=np.complex128)
+
+    if np.any(np.abs(v_open) < 1e-12):
+        raise ValueError("Open calibration gives near-zero voltage; cannot compute calibration.")
+
+    denominator = v_load - v_short
+    if np.any(np.abs(denominator) < 1e-12):
+        raise ValueError("Load and short calibration values are too similar to compute calibration.")
+
+    C = -1.0 / v_open
+    A = ref_resistance * (1.0 - v_load / v_open) / denominator
+    B = -A * v_short
+    D = np.ones_like(v_open, dtype=np.complex128)
+
+    return CalibrationCoefficients(A=A, B=B, C=C, D=D)
+
+
+# ============================================================================
+# Multi-tone Synthesis
+# ============================================================================
 
 def synthesize_multitone_fft(fft_size: int, bins: list[int]) -> np.ndarray:
     """
@@ -123,11 +145,12 @@ def synthesize_multitone_fft(fft_size: int, bins: list[int]) -> np.ndarray:
     Returns the FFT spectrum (complex array of size fft_size).
     """
     spectrum = np.zeros(fft_size, dtype=np.complex128)
-    phases = schroeder_phase_sequence(len(bins))
+    phases = np.array([
+        -np.pi * k * (k + 1) / len(bins) for k in range(len(bins))
+    ])
 
     for k, bin_idx in enumerate(bins):
         phase = phases[k]
-        # For conjugate symmetry, set both bin and mirror
         amplitude = TEST_SIGNAL_AMPLITUDE / np.sqrt(len(bins))
         spectrum[bin_idx] = amplitude * np.exp(1j * phase)
         if bin_idx != 0 and bin_idx != fft_size // 2:
@@ -141,18 +164,16 @@ def generate_multitone_time_signal(sample_count: int, bins: list[int]) -> np.nda
     """
     Generate time-domain multi-tone test signal by inverse FFT.
     Pads to sample_count with zeros at the end.
-    Returns real-valued time-domain signal (int16 normalized to DAC span).
+    Returns real-valued time-domain signal.
     """
     spectrum = synthesize_multitone_fft(FFT_SIZE, bins)
     time_signal = np.fft.ifft(spectrum)
     time_signal = np.real(time_signal)
 
-    # Normalize to DAC span
     peak = np.max(np.abs(time_signal))
     if peak > 0:
         time_signal = time_signal * (TEST_SIGNAL_AMPLITUDE / peak)
 
-    # Pad to requested length
     if sample_count > len(time_signal):
         time_signal = np.pad(time_signal, (0, sample_count - len(time_signal)))
     elif sample_count < len(time_signal):
@@ -212,10 +233,11 @@ class RingBuffer:
 class AudioStreamManager:
     """Manages PortAudio stream with duplex I/O and ring buffers."""
 
-    def __init__(self, device_id: int, sample_rate: int, fft_size: int):
+    def __init__(self, device_id: int, sample_rate: int, fft_size: int, sparse_bins: list[int]):
         self.device_id = device_id
         self.sample_rate = sample_rate
         self.fft_size = fft_size
+        self.sparse_bins = list(sparse_bins)
         self.stream = None
 
         # Ring buffers
@@ -224,7 +246,7 @@ class AudioStreamManager:
         self.recv_right = RingBuffer(BUFFER_RECV_LEN, num_channels=1)
 
         # Fill send buffer with repeating test signal
-        test_signal = generate_multitone_time_signal(fft_size, compute_sparse_frequencies())
+        test_signal = generate_multitone_time_signal(fft_size, self.sparse_bins)
         self.send_buffer.write(test_signal.astype(np.float32).reshape(-1, 1) / DAC_SPAN_PEAK)
         self.send_buffer.write(test_signal.astype(np.float32).reshape(-1, 1) / DAC_SPAN_PEAK)
 
@@ -247,16 +269,12 @@ class AudioStreamManager:
         if status:
             print(f"Audio status: {status}", file=sys.stderr)
 
-        # Generate output (stereo: left=test, right=test)
         send_data = self.send_buffer.read(self.total_samples % BUFFER_SEND_LEN, frames)
         outdata[:, 0] = send_data[:, 0]
         outdata[:, 1] = send_data[:, 0]
 
-        # Accumulate input (left=measurement, right=reference)
         with self.lock:
-            # Left channel (measurement)
             self.recv_left.write(indata[:, 0].reshape(-1, 1))
-            # Right channel (reference)
             self.recv_right.write(indata[:, 1].reshape(-1, 1))
             self.recv_write_pos = self.recv_left.get_write_pos()
             self.total_samples += frames
@@ -295,76 +313,99 @@ class DSPWorker(QObject):
     Runs in a separate QThread and emits signals for UI updates.
     """
 
-    spectrum_ready = Signal(dict)  # Emits {'magnitude': array, 'phase': array, 'frequencies': array}
+    spectrum_ready = Signal(dict)
     error_occurred = Signal(str)
 
-    def __init__(self, stream_manager: AudioStreamManager):
+    def __init__(self, stream_manager: AudioStreamManager, sparse_bins: list[int]):
         super().__init__()
         self.stream_manager = stream_manager
         self.running = False
         self.fft_size = stream_manager.fft_size
         self.sample_rate = stream_manager.sample_rate
-        self.sparse_bins = compute_sparse_frequencies()
-        self.calibration = CalibrationCoefficients()
+        self.sparse_bins = list(sparse_bins)
+        self.calibration = CalibrationCoefficients(A=np.ones(1, dtype=np.complex128),
+                                                  B=np.zeros(1, dtype=np.complex128),
+                                                  C=np.zeros(1, dtype=np.complex128),
+                                                  D=np.ones(1, dtype=np.complex128))
+        self.last_V = None
+        self.last_ref_pp_dbfs = -60.0
+        self.last_meas_pp_dbfs = -60.0
         self.last_recv_pos = 0
         self.fft_count = 0
 
     def process_fft_block(self):
-        """
-        If a complete FFT_SIZE block is available, process it.
-        """
+        """If a complete FFT_SIZE block is available, process it."""
         with self.stream_manager.lock:
             recv_write_pos = self.stream_manager.recv_write_pos
             available = (recv_write_pos - self.last_recv_pos) % BUFFER_RECV_LEN
 
         if available < self.fft_size:
-            return  # Not enough data
+            return
 
-        # Read FFT_SIZE samples from each channel
         left_data = self.stream_manager.recv_left.read(self.last_recv_pos, self.fft_size)
         right_data = self.stream_manager.recv_right.read(self.last_recv_pos, self.fft_size)
-
         self.last_recv_pos = (self.last_recv_pos + self.fft_size) % BUFFER_RECV_LEN
 
-        # Compute FFTs
         left_spectrum = np.fft.fft(left_data[:, 0])
         right_spectrum = np.fft.fft(right_data[:, 0])
 
-        # Compute complex quotients V at sparse frequencies
-        magnitude_db = []
-        phase_deg = []
-        frequencies = []
+        bin_idx = np.asarray(self.sparse_bins, dtype=np.int64)
+        frequencies = bin_idx * (self.sample_rate / self.fft_size)
 
-        for bin_idx in self.sparse_bins:
-            try:
-                freq = bin_idx * (self.sample_rate / self.fft_size)
-                frequencies.append(freq)
+        ref_vals = right_spectrum[bin_idx]
+        valid = np.abs(ref_vals) > 1e-9
 
-                if np.abs(right_spectrum[bin_idx]) < 1e-9:
-                    # Reference too small; skip this frequency
-                    magnitude_db.append(-120)
-                    phase_deg.append(0)
-                else:
-                    V = left_spectrum[bin_idx] / right_spectrum[bin_idx]
+        V = np.empty(bin_idx.size, dtype=np.complex128)
+        V.fill(np.nan + 0j)
+        np.divide(left_spectrum[bin_idx], ref_vals, out=V, where=valid)
+        self.last_V = V.copy()
 
-                    # Compute impedance (simplified: just return V for now)
-                    Z = V  # In v0.1, skip two-port calibration
+        A = np.asarray(self.calibration.A, dtype=np.complex128)
+        B = np.asarray(self.calibration.B, dtype=np.complex128)
+        C = np.asarray(self.calibration.C, dtype=np.complex128)
+        D = np.asarray(self.calibration.D, dtype=np.complex128)
 
-                    magnitude_db.append(20 * np.log10(np.abs(Z) + 1e-9))
-                    phase_deg.append(np.degrees(np.angle(Z)))
-            except Exception as e:
-                self.error_occurred.emit(f"FFT processing error: {e}")
-                return
+        if A.shape != V.shape:
+            A = np.ones_like(V, dtype=np.complex128)
+        if B.shape != V.shape:
+            B = np.zeros_like(V, dtype=np.complex128)
+        if C.shape != V.shape:
+            C = np.zeros_like(V, dtype=np.complex128)
+        if D.shape != V.shape:
+            D = np.ones_like(V, dtype=np.complex128)
+
+        Z = (A * V + B) / (C * V + D)
+
+        magnitude_db = np.full(V.shape, -120.0, dtype=np.float64)
+        phase_deg = np.zeros(V.shape, dtype=np.float64)
+
+        valid_z = np.isfinite(Z)
+        magnitude_db[valid_z] = 20.0 * np.log10(np.abs(Z[valid_z]) + 1e-9)
+        phase_deg[valid_z] = np.degrees(np.angle(Z[valid_z]))
+
+        self.last_meas_pp_dbfs = self.compute_pp_dbfs(left_data[:, 0])
+        self.last_ref_pp_dbfs = self.compute_pp_dbfs(right_data[:, 0])
 
         self.fft_count += 1
 
-        # Emit signal with results
         self.spectrum_ready.emit({
-            'magnitude_db': np.array(magnitude_db),
-            'phase_deg': np.array(phase_deg),
-            'frequencies': np.array(frequencies),
+            'magnitude_db': magnitude_db,
+            'phase_deg': phase_deg,
+            'frequencies': frequencies,
             'fft_count': self.fft_count,
+            'ref_dbfs': self.last_ref_pp_dbfs,
+            'meas_dbfs': self.last_meas_pp_dbfs,
         })
+
+    @staticmethod
+    def compute_pp_dbfs(data: np.ndarray) -> float:
+        """Peak-to-peak amplitude in dBFS, spanning -6 dB to 0 dB target."""
+        adc_full_scale_pp = 2.0 * 32767.0
+        pp = float(np.ptp(data))
+        if pp <= 0.0:
+            return -60.0
+        dbfs = 20.0 * np.log10(pp / adc_full_scale_pp)
+        return float(np.clip(dbfs, -6.0, 0.0))
 
     def run_loop(self):
         """Main processing loop (called by Qt timer from main thread)."""
@@ -382,36 +423,32 @@ class SpectrumCanvas(FigureCanvas):
     def __init__(self, parent=None):
         self.fig = Figure(figsize=(8, 6), dpi=100)
         self.fig.patch.set_facecolor('white')
-        
-        # Create main axis for magnitude
+
         self.ax_mag = self.fig.add_subplot(111)
         self.ax_mag.set_xlabel('Frequency (Hz)', fontsize=10)
         self.ax_mag.set_ylabel('Magnitude (dB)', color='blue', fontsize=10)
         self.ax_mag.tick_params(axis='y', labelcolor='blue')
         self.ax_mag.set_xscale('log')
         self.ax_mag.grid(True, alpha=0.3, which='both')
-        
-        # Create secondary axis for phase (shares x-axis, independent y-axis)
+
         self.ax_phase = self.ax_mag.twinx()
         self.ax_phase.set_ylabel('Phase (°)', color='red', fontsize=10)
         self.ax_phase.tick_params(axis='y', labelcolor='red')
-        self.ax_phase.set_ylim(-180, 180)  # Fixed range
-        
-        # Plot lines (will be created on first data)
+        self.ax_phase.set_ylim(-180, 180)
+
         self.line_mag, = self.ax_mag.plot([], [], 'b-', linewidth=2, label='Magnitude', zorder=2)
         self.line_phase, = self.ax_phase.plot([], [], 'r-', linewidth=2, label='Phase', zorder=1)
-        
-        # Add legends
+
         lines_mag = [self.line_mag]
         lines_phase = [self.line_phase]
         labels_mag = [l.get_label() for l in lines_mag]
         labels_phase = [l.get_label() for l in lines_phase]
-        
+
         self.ax_mag.legend(lines_mag, labels_mag, loc='upper left', fontsize=9)
         self.ax_phase.legend(lines_phase, labels_phase, loc='upper right', fontsize=9)
-        
+
         self.fig.tight_layout()
-        
+
         super().__init__(self.fig)
         self.setParent(parent)
 
@@ -419,12 +456,10 @@ class SpectrumCanvas(FigureCanvas):
         """Update plot with new data."""
         self.line_mag.set_data(frequencies, magnitude_db)
         self.line_phase.set_data(frequencies, phase_deg)
-        
-        # Auto-scale magnitude axis
+
         self.ax_mag.relim()
         self.ax_mag.autoscale_view(scalex=True, scaley=True)
-        
-        # Redraw
+
         self.fig.canvas.draw_idle()
 
 
@@ -443,94 +478,187 @@ class ImpedanceAnalyzerUI(QMainWindow):
         self.setWindowTitle("Impedance Spectrum Analyzer v0.4 (matplotlib)")
         self.setGeometry(100, 100, 1600, 900)
 
-        # Central widget layout
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         main_layout = QHBoxLayout(central_widget)
 
-        # Left: Plot area (takes most space)
         self.canvas = SpectrumCanvas(self)
         main_layout.addWidget(self.canvas, 3)
 
-        # Right: Control panel
         control_panel = QWidget()
         control_layout = QVBoxLayout(control_panel)
 
-        # FFT_size
         control_layout.addWidget(QLabel("FFT Size:"))
         self.fft_size_spinbox = QSpinBox()
         self.fft_size_spinbox.setMinimum(1024)
         self.fft_size_spinbox.setMaximum(262144)
         self.fft_size_spinbox.setValue(FFT_SIZE)
-        self.fft_size_spinbox.setEnabled(False)  # Fixed for now
+        self.fft_size_spinbox.setEnabled(False)
         control_layout.addWidget(self.fft_size_spinbox)
 
-        # Frequency points
         control_layout.addWidget(QLabel("Frequency Points:"))
         self.freq_points_label = QLabel(f"{len(self.dsp_worker.sparse_bins)}")
         control_layout.addWidget(self.freq_points_label)
 
-        # Amplitude
-        control_layout.addWidget(QLabel("Test Amplitude (V):"))
-        self.amplitude_spinbox = QDoubleSpinBox()
-        self.amplitude_spinbox.setMinimum(0.01)
-        self.amplitude_spinbox.setMaximum(10.0)
-        self.amplitude_spinbox.setValue(TEST_SIGNAL_AMPLITUDE / DAC_SPAN_PEAK)
-        control_layout.addWidget(self.amplitude_spinbox)
+        control_layout.addWidget(QLabel("Reference Resistance (Ω):"))
+        self.ref_resistance_spinbox = QDoubleSpinBox()
+        self.ref_resistance_spinbox.setRange(1.0, 1e6)
+        self.ref_resistance_spinbox.setDecimals(3)
+        self.ref_resistance_spinbox.setValue(100.0)
+        control_layout.addWidget(self.ref_resistance_spinbox)
 
-        # Phase offset (display only)
-        control_layout.addWidget(QLabel("Phase offset: 0°"))
+        self.ref_level_label = QLabel("Reference level")
+        self.ref_level_bar = QProgressBar()
+        self.ref_level_bar.setRange(0, 100)
+        self.ref_level_bar.setValue(0)
+        self.ref_level_bar.setFormat("-6 dBFS")
+        self.ref_level_bar.setStyleSheet("QProgressBar { border: 1px solid gray; text-align: center; }")
+        control_layout.addWidget(self.ref_level_label)
+        control_layout.addWidget(self.ref_level_bar)
 
-        # Buttons
-        self.start_button = QPushButton("Start")
-        self.start_button.clicked.connect(self.on_start)
-        control_layout.addWidget(self.start_button)
+        self.meas_level_label = QLabel("Measurement level")
+        self.meas_level_bar = QProgressBar()
+        self.meas_level_bar.setRange(0, 100)
+        self.meas_level_bar.setValue(0)
+        self.meas_level_bar.setFormat("-6 dBFS")
+        self.meas_level_bar.setStyleSheet("QProgressBar { border: 1px solid gray; text-align: center; }")
+        control_layout.addWidget(self.meas_level_label)
+        control_layout.addWidget(self.meas_level_bar)
 
-        self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.on_stop)
-        self.stop_button.setEnabled(False)
-        control_layout.addWidget(self.stop_button)
-
-        # Calibration buttons (placeholders)
         control_layout.addWidget(QLabel("Calibration:"))
         self.cal_open_button = QPushButton("Calibrate Open")
         self.cal_open_button.clicked.connect(self.on_calibrate_open)
+        self.cal_open_button.setStyleSheet("background-color: lightgray;")
         control_layout.addWidget(self.cal_open_button)
 
         self.cal_short_button = QPushButton("Calibrate Short")
         self.cal_short_button.clicked.connect(self.on_calibrate_short)
+        self.cal_short_button.setStyleSheet("background-color: lightgray;")
         control_layout.addWidget(self.cal_short_button)
 
-        self.cal_load_button = QPushButton("Calibrate Load (100Ω)")
+        self.cal_load_button = QPushButton("Calibrate Load")
         self.cal_load_button.clicked.connect(self.on_calibrate_load)
+        self.cal_load_button.setStyleSheet("background-color: lightgray;")
         control_layout.addWidget(self.cal_load_button)
 
-        # Status area
-        control_layout.addStretch()
+        self.apply_cal_button = QPushButton("Apply Cal")
+        self.apply_cal_button.clicked.connect(self.on_apply_cal)
+        self.apply_cal_button.setStyleSheet("background-color: lightgray;")
+        control_layout.addWidget(self.apply_cal_button)
+
+        self.ratio_only_button = QPushButton("Ratio Only")
+        self.ratio_only_button.clicked.connect(self.on_ratio_only)
+        self.ratio_only_button.setStyleSheet("background-color: lightgray;")
+        control_layout.addWidget(self.ratio_only_button)
+
         self.status_label = QLabel("Ready.")
         self.status_label.setWordWrap(True)
         control_layout.addWidget(self.status_label)
 
         main_layout.addWidget(control_panel, 1)
 
-        # Connect DSP signals
         self.dsp_worker.spectrum_ready.connect(self.on_spectrum_ready)
         self.dsp_worker.error_occurred.connect(self.on_dsp_error)
 
-        # Timer for DSP processing loop
         self.dsp_timer = QTimer()
         self.dsp_timer.timeout.connect(self.dsp_worker.run_loop)
-        self.dsp_timer.setInterval(50)  # Process every 50 ms
+        self.dsp_timer.setInterval(50)
+
+        self.V_open = None
+        self.V_short = None
+        self.V_load = None
+
+        self.on_ratio_only()
+
+    def _set_button_state(self, button: QPushButton, active: bool):
+        button.setStyleSheet("background-color: lightgreen;" if active else "background-color: lightgray;")
+
+    def _reset_calibration_buttons(self):
+        self._set_button_state(self.cal_open_button, False)
+        self._set_button_state(self.cal_short_button, False)
+        self._set_button_state(self.cal_load_button, False)
+        self._set_button_state(self.apply_cal_button, False)
+        self._set_button_state(self.ratio_only_button, False)
+
+    def _update_level_bar(self, bar: QProgressBar, value_dbfs: float):
+        value = int(np.clip((value_dbfs + 6.0) / 6.0 * 100.0, 0.0, 100.0))
+        bar.setValue(value)
+        bar.setFormat(f"{value_dbfs:.1f} dBFS")
+
+    def on_calibrate_open(self):
+        """Store last measured V under open condition."""
+        if self.dsp_worker.last_V is None:
+            self.status_label.setText("No V data available yet.")
+            return
+        self.V_open = self.dsp_worker.last_V.copy()
+        self._set_button_state(self.cal_open_button, True)
+        self.status_label.setText("Opencal saved.")
+
+    def on_calibrate_short(self):
+        """Store last measured V under short condition."""
+        if self.dsp_worker.last_V is None:
+            self.status_label.setText("No V data available yet.")
+            return
+        self.V_short = self.dsp_worker.last_V.copy()
+        self._set_button_state(self.cal_short_button, True)
+        self.status_label.setText("Shortcal saved.")
+
+    def on_calibrate_load(self):
+        """Store last measured V under resistive load condition."""
+        if self.dsp_worker.last_V is None:
+            self.status_label.setText("No V data available yet.")
+            return
+        self.V_load = self.dsp_worker.last_V.copy()
+        self._set_button_state(self.cal_load_button, True)
+        self.status_label.setText("Loadcal saved.")
+
+    def apply_calibration(self):
+        """Apply the calibration coefficients according to the specified formula."""
+        if self.V_open is None or self.V_short is None or self.V_load is None:
+            self.status_label.setText("Calibration data incomplete; all of Open, Short, and Load must be saved first.")
+            return
+
+        try:
+            ref_resistance = float(self.ref_resistance_spinbox.value())
+            coeffs = apply_calibration_coefficients(self.V_open, self.V_short, self.V_load, ref_resistance)
+            self.dsp_worker.calibration = coeffs
+            self.status_label.setText("Calibration applied.")
+        except ValueError as exc:
+            self.status_label.setText(f"Calibration error: {exc}")
+            print(f"Calibration error: {exc}", file=sys.stderr)
+
+    def on_apply_cal(self):
+        """Apply calibration and reset other calibration buttons to grey."""
+        self._reset_calibration_buttons()
+        self.apply_calibration()
+        self._set_button_state(self.apply_cal_button, True)
+
+    def on_ratio_only(self):
+        """Return to pure ratio mode."""
+        self._reset_calibration_buttons()
+        self.V_open = None
+        self.V_short = None
+        self.V_load = None
+
+        self.dsp_worker.calibration = CalibrationCoefficients(
+            A=np.ones(1, dtype=np.complex128),
+            B=np.zeros(1, dtype=np.complex128),
+            C=np.zeros(1, dtype=np.complex128),
+            D=np.ones(1, dtype=np.complex128),
+        )
+        self._set_button_state(self.ratio_only_button, True)
+        self.status_label.setText("Ratio-only mode active.")
 
     @Slot(dict)
     def on_spectrum_ready(self, data: dict):
-        """Update plot when FFT results are ready."""
+        """Update plot and level bars when FFT results are ready."""
         frequencies = data['frequencies']
         magnitude_db = data['magnitude_db']
         phase_deg = data['phase_deg']
 
-        # Update matplotlib canvas
         self.canvas.update_plot(frequencies, magnitude_db, phase_deg)
+        self._update_level_bar(self.ref_level_bar, data['ref_dbfs'])
+        self._update_level_bar(self.meas_level_bar, data['meas_dbfs'])
 
         self.status_label.setText(
             f"FFT #{data['fft_count']}: {len(frequencies)} frequencies, "
@@ -558,18 +686,6 @@ class ImpedanceAnalyzerUI(QMainWindow):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Acquisition stopped.")
-
-    def on_calibrate_open(self):
-        """Placeholder for open calibration."""
-        self.status_label.setText("Open calibration: placeholder (v0.2+)")
-
-    def on_calibrate_short(self):
-        """Placeholder for short calibration."""
-        self.status_label.setText("Short calibration: placeholder (v0.2+)")
-
-    def on_calibrate_load(self):
-        """Placeholder for load calibration."""
-        self.status_label.setText("Load calibration (100Ω): placeholder (v0.2+)")
 
     def closeEvent(self, event):
         """Clean up on window close."""
@@ -605,10 +721,8 @@ def main():
         print(sd.query_devices())
         return
 
-    # Initialize Qt application
     app = QApplication(sys.argv)
 
-    # Select audio device
     device_id = args.device if args.device is not None else sd.default.device
 
     try:
@@ -617,22 +731,17 @@ def main():
         print(f"Error querying device: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Create audio stream manager
     try:
-        stream_manager = AudioStreamManager(device_id, SAMPLE_RATE, FFT_SIZE)
+        stream_manager = AudioStreamManager(device_id, SAMPLE_RATE, FFT_SIZE, SPARSE_FREQ_BINS)
         stream_manager.start()
     except Exception as e:
         print(f"Failed to initialize audio: {e}", file=sys.stderr)
         sys.exit(1)
 
-    # Create DSP worker
-    dsp_worker = DSPWorker(stream_manager)
-
-    # Create and show UI
+    dsp_worker = DSPWorker(stream_manager, SPARSE_FREQ_BINS)
     ui = ImpedanceAnalyzerUI(stream_manager, dsp_worker)
     ui.show()
 
-    # Run Qt application
     sys.exit(app.exec())
 
 
